@@ -950,15 +950,125 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
+async function cleanupSelfTest(email, code) {
+  try {
+    const user = await getUserByEmail(email);
+    if (pool) {
+      if (user) {
+        await pool.query(`DELETE FROM ${SCHEMA}.favorites WHERE user_id=$1`, [user.id]);
+        await pool.query(`DELETE FROM ${SCHEMA}.wrong_questions WHERE user_id=$1`, [user.id]);
+        await pool.query(`DELETE FROM ${SCHEMA}.membership_logs WHERE user_id=$1`, [user.id]);
+      }
+      if (code) {
+        await pool.query(`DELETE FROM ${SCHEMA}.activation_codes WHERE code=$1`, [code]);
+      }
+      await pool.query(`DELETE FROM ${SCHEMA}.users WHERE email=$1`, [email]);
+    } else {
+      if (user) {
+        await redis.del('tiku:fav:' + user.id);
+        await redis.del('tiku:wrong:' + user.id);
+      }
+      if (code) {
+        await redis.del(codeKey(code));
+        await redis.srem('tiku:codes', code);
+      }
+      await redis.del(userKey(email));
+      await redis.srem('tiku:users', email);
+    }
+  } catch (e) {
+    console.error('SELF_TEST_CLEANUP_FAIL', e.message);
+  }
+}
+
+async function runHttpSelfTest() {
+  const testEmail = 'buyer-selftest-' + Date.now() + '@example.invalid';
+  const testPassword = 'TestPass123!';
+  let testCode = '';
+  const base = 'http://127.0.0.1:' + PORT;
+
+  async function call(url, options={}) {
+    const response = await fetch(base + url, {
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(options.headers || {})
+      }
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(url + ' -> ' + response.status + ' ' + (body.message || 'request failed'));
+    }
+    return body;
+  }
+
+  try {
+    const adminLogin = await call('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD })
+    });
+
+    const generated = await call('/api/admin/codes/generate', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + adminLogin.token },
+      body: JSON.stringify({ count: 1, days: 30, plan: 'vip' })
+    });
+    testCode = generated.codes[0];
+
+    const buyer = await call('/api/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: '流程测试买家',
+        email: testEmail,
+        password: testPassword
+      })
+    });
+
+    const activated = await call('/api/activate', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + buyer.token },
+      body: JSON.stringify({ code: testCode })
+    });
+
+    if (!activated.membership || !activated.membership.active) {
+      throw new Error('membership was not activated');
+    }
+
+    const practice = await call('/api/quiz/random?limit=1', {
+      headers: { Authorization: 'Bearer ' + buyer.token }
+    });
+    if (!Array.isArray(practice.questions) || practice.questions.length < 1) {
+      throw new Error('VIP practice endpoint returned no questions');
+    }
+
+    const membership = await call('/api/membership', {
+      headers: { Authorization: 'Bearer ' + buyer.token }
+    });
+    if (!membership.membership || !membership.membership.active) {
+      throw new Error('membership check failed after activation');
+    }
+
+    console.log(
+      'SELF_TEST_PASS admin_login code_generate buyer_register code_redeem vip_practice membership_check'
+    );
+  } catch (e) {
+    console.error('SELF_TEST_FAIL', e.message);
+  } finally {
+    await cleanupSelfTest(testEmail, testCode);
+  }
+}
+
 redis.on('error', err => console.error('Redis error:', err.message));
 
 ensureSeed()
   .then(() => {
-    app.listen(PORT, '0.0.0.0', () => {
+    app.listen(PORT, '0.0.0.0', async () => {
       console.log(
         'TikuGo running on port ' + PORT +
         ' using ' + (pool ? 'PostgreSQL schema ' + SCHEMA : 'Redis fallback')
       );
+      if (process.env.SELF_TEST_ON_START === '1') {
+        await runHttpSelfTest();
+      }
     });
   })
   .catch(err => {

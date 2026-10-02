@@ -149,6 +149,17 @@ async function initPostgres() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS ${SCHEMA}.usage_events (
+      id TEXT PRIMARY KEY,
+      user_id TEXT,
+      event_type TEXT NOT NULL,
+      detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_tiku_go_usage_events_user
+      ON ${SCHEMA}.usage_events(user_id, created_at DESC);
+
     CREATE TABLE IF NOT EXISTS ${SCHEMA}.meta (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL,
@@ -248,6 +259,19 @@ async function listUsers() {
   }
   const rows = await Promise.all([...new Set(emails)].map(getUserByEmail));
   return rows.filter(Boolean);
+}
+
+async function logUsage(userId, eventType, detail={}) {
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO ${SCHEMA}.usage_events(id,user_id,event_type,detail)
+       VALUES($1,$2,$3,$4::jsonb)`,
+      [makeId(), userId || null, eventType, JSON.stringify(detail || {})]
+    );
+  } catch (e) {
+    console.error('usage log failed:', e.message);
+  }
 }
 
 async function getQuestion(id) {
@@ -525,6 +549,11 @@ async function redeemCode(email, code) {
          (id,user_id,action,days,code,note)
          VALUES($1,$2,'activate',$3,$4,$5)`,
         [makeId(), u.id, c.days, code, 'Activation code redeemed']
+      );
+      await client.query(
+        `INSERT INTO ${SCHEMA}.usage_events(id,user_id,event_type,detail)
+         VALUES($1,$2,'activate',$3::jsonb)`,
+        [makeId(), u.id, JSON.stringify({ code, days: c.days, plan: c.plan, expiresAt: expiresAt.toISOString() })]
       );
       await client.query('COMMIT');
       return { plan: c.plan, expiresAt: expiresAt.toISOString() };
@@ -838,6 +867,7 @@ app.get('/api/quiz/random', auth, vipOnly, async (req, res) => {
   if (category) rows = rows.filter(q => q.category === category);
   rows.sort(() => Math.random() - 0.5);
 
+  await logUsage(req.user.id, 'quiz', { category: category || '全部', count: Math.min(limit, rows.length) });
   res.json({ questions: rows.slice(0, limit) });
 });
 
@@ -874,7 +904,9 @@ app.get('/api/favorites', auth, vipOnly, async (req, res) => {
 });
 
 app.post('/api/favorites/:id', auth, vipOnly, async (req, res) => {
-  res.json({ favorite: await toggleFavorite(req.user.id, req.params.id) });
+  const favorite = await toggleFavorite(req.user.id, req.params.id);
+  await logUsage(req.user.id, favorite ? 'favorite_add' : 'favorite_remove', { questionId: req.params.id });
+  res.json({ favorite });
 });
 
 app.get('/api/wrong', auth, vipOnly, async (req, res) => {
@@ -883,12 +915,50 @@ app.get('/api/wrong', auth, vipOnly, async (req, res) => {
 
 app.post('/api/wrong/:id', auth, vipOnly, async (req, res) => {
   await setWrong(req.user.id, req.params.id, true);
+  await logUsage(req.user.id, 'wrong_add', { questionId: req.params.id });
   res.json({ ok: true });
 });
 
 app.delete('/api/wrong/:id', auth, vipOnly, async (req, res) => {
   await setWrong(req.user.id, req.params.id, false);
   res.json({ ok: true });
+});
+
+app.get('/api/admin/dashboard', auth, adminOnly, async (req, res) => {
+  if (!pool) return res.json({ users:0, activeMembers:0, questions:0, unusedCodes:0, usedCodes:0 });
+  const [u,m,q,cu,cs] = await Promise.all([
+    pool.query(`SELECT COUNT(*)::int AS n FROM ${SCHEMA}.users WHERE role <> 'admin'`),
+    pool.query(`SELECT COUNT(*)::int AS n FROM ${SCHEMA}.users WHERE role <> 'admin' AND membership_expires_at > NOW()`),
+    pool.query(`SELECT COUNT(*)::int AS n FROM ${SCHEMA}.questions`),
+    pool.query(`SELECT COUNT(*)::int AS n FROM ${SCHEMA}.activation_codes WHERE status='unused'`),
+    pool.query(`SELECT COUNT(*)::int AS n FROM ${SCHEMA}.activation_codes WHERE status='used'`)
+  ]);
+  res.json({
+    users:u.rows[0].n,
+    activeMembers:m.rows[0].n,
+    questions:q.rows[0].n,
+    unusedCodes:cu.rows[0].n,
+    usedCodes:cs.rows[0].n
+  });
+});
+
+app.get('/api/admin/activity', auth, adminOnly, async (req, res) => {
+  if (!pool) return res.json({ events: [] });
+  const { rows } = await pool.query(
+    `SELECT e.id,e.event_type,e.detail,e.created_at,u.name,u.email
+     FROM ${SCHEMA}.usage_events e
+     LEFT JOIN ${SCHEMA}.users u ON u.id=e.user_id
+     ORDER BY e.created_at DESC
+     LIMIT 500`
+  );
+  res.json({ events: rows.map(r => ({
+    id:r.id,
+    type:r.event_type,
+    detail:r.detail || {},
+    createdAt:r.created_at,
+    name:r.name || '',
+    email:r.email || ''
+  })) });
 });
 
 app.get('/api/admin/codes', auth, adminOnly, async (req, res) => {
@@ -925,6 +995,8 @@ app.post('/api/admin/users/extend', auth, adminOnly, async (req, res) => {
     const email = String(req.body.email || '').toLowerCase();
     const days = Math.max(1, Number(req.body.days || 30));
     const expiresAt = await extendUser(email, days, String(req.body.plan || 'vip'));
+    const u = await getUserByEmail(email);
+    if (u) await logUsage(u.id, 'admin_extend', { days, expiresAt });
     res.json({ ok: true, expiresAt });
   } catch (e) {
     res.status(400).json({ message: e.message });
@@ -943,7 +1015,15 @@ app.post('/api/admin/users/revoke', auth, adminOnly, async (req, res) => {
       [makeId(), user.id, 'Admin revoked membership']
     );
   }
+  if (user) await logUsage(user.id, 'admin_revoke', {});
   res.json({ ok: true });
+});
+
+app.get('/admin', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'admin.html'));
+});
+app.get('/admin/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'admin.html'));
 });
 
 app.get('*', (req, res) => {
@@ -958,6 +1038,7 @@ async function cleanupSelfTest(email, code) {
         await pool.query(`DELETE FROM ${SCHEMA}.favorites WHERE user_id=$1`, [user.id]);
         await pool.query(`DELETE FROM ${SCHEMA}.wrong_questions WHERE user_id=$1`, [user.id]);
         await pool.query(`DELETE FROM ${SCHEMA}.membership_logs WHERE user_id=$1`, [user.id]);
+        await pool.query(`DELETE FROM ${SCHEMA}.usage_events WHERE user_id=$1`, [user.id]);
       }
       if (code) {
         await pool.query(`DELETE FROM ${SCHEMA}.activation_codes WHERE code=$1`, [code]);

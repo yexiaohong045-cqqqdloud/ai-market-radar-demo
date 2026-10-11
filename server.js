@@ -924,6 +924,70 @@ app.delete('/api/wrong/:id', auth, vipOnly, async (req, res) => {
   res.json({ ok: true });
 });
 
+// Export a consistent snapshot without opening external database access.
+// Require password reauthentication as well as the existing admin session.
+app.post('/api/admin/backup', auth, adminOnly, async (req, res) => {
+  let client;
+  try {
+    const admin = await getUserByEmail(req.user.email);
+    if (!admin || admin.role !== 'admin' || admin.id !== req.user.id ||
+        !(await bcrypt.compare(String(req.body.password || ''), admin.passwordHash || ''))) {
+      return res.status(403).json({ message: '请输入正确的管理员密码以导出备份' });
+    }
+    if (!pool) return res.status(503).json({ message: '完整备份需要 PostgreSQL 存储' });
+    client = await pool.connect();
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    await client.query("SET LOCAL statement_timeout = '60s'");
+    const { rows: found } = await client.query(
+      `SELECT tablename FROM pg_tables WHERE schemaname=$1 ORDER BY tablename`, [SCHEMA]
+    );
+    const tables = {};
+    const counts = {};
+    const definitions = {};
+    for (const { tablename } of found) {
+      const quoted = '"' + tablename.replace(/"/g, '""') + '"';
+      const { rows } = await client.query(`SELECT row_to_json(t) AS row FROM ${SCHEMA}.${quoted} t`);
+      tables[tablename] = rows.map(r => r.row);
+      counts[tablename] = rows.length;
+      const cols = await client.query(
+        `SELECT a.attname AS name, format_type(a.atttypid,a.atttypmod) AS type,
+          a.attnotnull AS not_null, pg_get_expr(d.adbin,d.adrelid) AS default_value
+         FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid
+         JOIN pg_namespace n ON n.oid=c.relnamespace
+         LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+         WHERE n.nspname=$1 AND c.relname=$2 AND a.attnum>0 AND NOT a.attisdropped
+         ORDER BY a.attnum`, [SCHEMA, tablename]
+      );
+      const constraints = await client.query(
+        `SELECT co.conname AS name, pg_get_constraintdef(co.oid) AS definition
+         FROM pg_constraint co JOIN pg_class c ON c.oid=co.conrelid
+         JOIN pg_namespace n ON n.oid=c.relnamespace
+         WHERE n.nspname=$1 AND c.relname=$2`, [SCHEMA, tablename]
+      );
+      const indexes = await client.query(
+        `SELECT indexdef FROM pg_indexes WHERE schemaname=$1 AND tablename=$2
+         AND indexname NOT IN (SELECT conname FROM pg_constraint co
+           JOIN pg_class c ON c.oid=co.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+           WHERE n.nspname=$1 AND c.relname=$2)`, [SCHEMA, tablename]
+      );
+      definitions[tablename] = { columns: cols.rows, constraints: constraints.rows,
+        indexes: indexes.rows.map(r => r.indexdef) };
+    }
+    const snapshot = { format:'tiku-go-postgres-backup', version:1, schema:SCHEMA,
+      exportedAt:now(), counts, definitions, tables };
+    await client.query('COMMIT');
+    res.set('Cache-Control', 'no-store');
+    res.set('Content-Disposition', 'attachment; filename="tiku-go-backup.json"');
+    res.json(snapshot);
+  } catch (e) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
+    console.error('Backup export failed:', e.message);
+    res.status(500).json({ message: '备份导出失败，请稍后重试' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
 app.get('/api/admin/dashboard', auth, adminOnly, async (req, res) => {
   if (!pool) return res.json({ users:0, activeMembers:0, questions:0, unusedCodes:0, usedCodes:0 });
   const [u,m,q,cu,cs] = await Promise.all([
@@ -1156,3 +1220,5 @@ ensureSeed()
     console.error(err);
     process.exit(1);
   });
+
+
